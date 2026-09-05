@@ -126,34 +126,49 @@ async function extractNativeTextLines(pdf){
   return allLines;
 }
 
+async function renderPageToCanvas(pdf, p, scale){
+  const page = await pdf.getPage(p);
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  if (!canvas.width || !canvas.height){
+    throw new Error(`canvas com dimensões inválidas (${canvas.width}x${canvas.height})`);
+  }
+  return canvas;
+}
+
 async function extractLinesViaOCR(pdf, onProgress){
   if (typeof Tesseract === 'undefined'){
     throw new Error("Tesseract.js não carregou (biblioteca de OCR indisponível — verifique a conexão ou se algum bloqueador de scripts está ativo).");
   }
-  const allLines = [];
-  let worker;
+  const numPages = pdf.numPages;
+  const CONCURRENCY = Math.min(4, numPages);
+  const results = new Array(numPages);
+  let completed = 0;
+
+  let workers;
   try{
-    worker = await Tesseract.createWorker('por', 1, {
-      logger: m => { if (onProgress) onProgress(m); }
-    });
+    workers = await Promise.all(
+      Array.from({ length: CONCURRENCY }, () => Tesseract.createWorker('por', 1))
+    );
   } catch(err){
     throw new Error(`Falha ao iniciar o motor de OCR: ${err && err.message ? err.message : String(err)}`);
   }
-  try{
-    for (let p=1; p<=pdf.numPages; p++){
-      if (onProgress) onProgress({ status: `ocr página ${p}/${pdf.numPages}` });
+
+  // Simple shared queue: each worker keeps pulling the next page number
+  // until none are left, so all workers stay busy (round-robin split).
+  let nextPage = 1;
+  const takeNext = () => (nextPage <= numPages ? nextPage++ : null);
+
+  async function runWorker(worker){
+    let p;
+    while ((p = takeNext()) !== null){
       let canvas;
       try{
-        const page = await pdf.getPage(p);
-        const viewport = page.getViewport({ scale: 2.5 });
-        canvas = document.createElement('canvas');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        const ctx = canvas.getContext('2d');
-        await page.render({ canvasContext: ctx, viewport }).promise;
-        if (!canvas.width || !canvas.height){
-          throw new Error(`canvas com dimensões inválidas (${canvas.width}x${canvas.height})`);
-        }
+        canvas = await renderPageToCanvas(pdf, p, 2.1);
       } catch(err){
         throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
       }
@@ -167,12 +182,19 @@ async function extractLinesViaOCR(pdf, onProgress){
       const words = (data.words || []).map(w => ({
         text: w.text, x: w.bbox.x0, x1: w.bbox.x1, y: (w.bbox.y0 + w.bbox.y1) / 2,
       })).filter(w => w.text && w.text.trim());
-      allLines.push(...buildLinesFromItems(words, 12, 55));
+      results[p - 1] = buildLinesFromItems(words, 12, 55);
+      completed++;
+      if (onProgress) onProgress({ status: `ocr ${completed}/${numPages} páginas` });
     }
-  } finally {
-    try{ await worker.terminate(); }catch(e){}
   }
-  return allLines;
+
+  try{
+    await Promise.all(workers.map(runWorker));
+  } finally {
+    await Promise.all(workers.map(w => w.terminate().catch(()=>{})));
+  }
+
+  return results.flat();
 }
 
 async function extractLinesFromPdf(file, onProgress){

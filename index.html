@@ -347,11 +347,12 @@ async function fetchSharedDiets(){
 
 async function pushSharedDiets(customDiets){
   if (!SHARED_SYNC_ENABLED) return { ok:true };
+  const payload = Object.keys(customDiets).length > 0 ? customDiets : { _empty: true };
   try{
     const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
       method: 'PUT',
       headers: { 'Content-Type':'application/json', 'X-Master-Key': JSONBIN_KEY },
-      body: JSON.stringify(customDiets)
+      body: JSON.stringify(payload)
     });
     if (!res.ok){
       let bodyText = '';

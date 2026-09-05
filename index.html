@@ -323,6 +323,10 @@ const JSONBIN_ID = "6a9b55d1da38895dfe3a6d51";
 const JSONBIN_KEY = "$2a$10$BO9sKMv22jmaqTnKuDzxte17aFKUMc4IDFh72mvKbUcUPHV2A2qpC";
 const SHARED_SYNC_ENABLED = !!(JSONBIN_ID && JSONBIN_KEY);
 
+function isValidKcalKey(k){
+  return /^\d+$/.test(k) && Number.isFinite(Number(k)) && Number(k) > 0;
+}
+
 async function fetchSharedDiets(){
   if (!SHARED_SYNC_ENABLED) return null;
   try{
@@ -331,7 +335,10 @@ async function fetchSharedDiets(){
     });
     if (!res.ok) throw new Error('status ' + res.status);
     const json = await res.json();
-    return (json && json.record) ? json.record : {};
+    const record = (json && json.record) ? json.record : {};
+    const clean = {};
+    for (const k of Object.keys(record)){ if (isValidKcalKey(k)) clean[k] = record[k]; }
+    return clean;
   } catch(e){
     console.error('Falha ao buscar dietas compartilhadas', e);
     return null;
@@ -1084,8 +1091,10 @@ async function loadAllDiets(){
     for (let i=0; i<localStorage.length; i++){
       const key = localStorage.key(i);
       if (key && key.startsWith("diet:")){
+        const kcal = key.replace("diet:","");
+        if (!isValidKcalKey(kcal)) continue;
         const val = localStorage.getItem(key);
-        if (val) diets[key.replace("diet:","")] = JSON.parse(val);
+        if (val) diets[kcal] = JSON.parse(val);
       }
     }
   }catch(e){ console.error(e); }
@@ -1246,7 +1255,7 @@ function fastingCardHtml(){
 }
 
 function dietSelectorHtml(){
-  const kcalKeys = Object.keys(state.diets).sort((a,b)=>Number(a)-Number(b));
+  const kcalKeys = Object.keys(state.diets).filter(isValidKcalKey).sort((a,b)=>Number(a)-Number(b));
   const chips = kcalKeys.map(k => `<div class="chip ${state.selectedKcal===k?'active':''}" data-action="select-kcal" data-kcal="${k}">${Number(k).toLocaleString('pt-BR')} kcal</div>`).join("");
   const uploadChip = state.isAdmin ? `<div class="chip dashed" data-action="open-upload">${state.loading?`<span class="spinner"></span> ${state.loadProgress||''}`:'+ Adicionar PDFs'}</div>` : '';
   return `
@@ -1437,7 +1446,7 @@ function attachEvents(){
             }
           });
           const parsed = parseDietText(lines);
-          if (!parsed.kcal || parsed.stats.dayCount === 0){
+          if (!parsed.kcal || !isValidKcalKey(String(parsed.kcal)) || parsed.stats.dayCount === 0){
             failed.push(file.name);
             debugDumps[file.name] = lines.join("\n");
           } else {

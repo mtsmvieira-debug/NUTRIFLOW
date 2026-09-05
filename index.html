@@ -346,18 +346,22 @@ async function fetchSharedDiets(){
 }
 
 async function pushSharedDiets(customDiets){
-  if (!SHARED_SYNC_ENABLED) return true;
+  if (!SHARED_SYNC_ENABLED) return { ok:true };
   try{
     const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
       method: 'PUT',
       headers: { 'Content-Type':'application/json', 'X-Master-Key': JSONBIN_KEY },
       body: JSON.stringify(customDiets)
     });
-    if (!res.ok) throw new Error('status ' + res.status);
-    return true;
+    if (!res.ok){
+      let bodyText = '';
+      try{ bodyText = await res.text(); }catch(e2){}
+      throw new Error(`status ${res.status}${bodyText ? ' — ' + bodyText.slice(0,200) : ''}`);
+    }
+    return { ok:true };
   } catch(e){
     console.error('Falha ao sincronizar dietas com todos', e);
-    return false;
+    return { ok:false, error: (e && e.message) ? e.message : String(e) };
   }
 }
 
@@ -1382,8 +1386,8 @@ function attachEvents(){
       else delete state.diets[k];
       if (state.selectedKcal === k) state.selectedKcal = BUILTIN_DIETS[k] ? k : null;
       render();
-      const ok = await pushSharedDiets(state.customDiets);
-      if (!ok && SHARED_SYNC_ENABLED){ state.loadError = "Removido aqui, mas não consegui sincronizar com os outros aparelhos agora."; render(); }
+      const result = await pushSharedDiets(state.customDiets);
+      if (!result.ok && SHARED_SYNC_ENABLED){ state.loadError = `Removido aqui, mas não consegui sincronizar com os outros aparelhos agora (${result.error}).`; render(); }
     } else if (action === "register-meal"){
       const input = document.getElementById("mealTimeInput");
       const time = input ? input.value : state.inputTime;
@@ -1478,17 +1482,19 @@ function attachEvents(){
       }
 
       let syncFailed = false;
+      let syncErrorMsg = "";
       if (anySucceeded && SHARED_SYNC_ENABLED){
         state.loadProgress = "sincronizando pra todo mundo…";
         render();
-        const ok = await pushSharedDiets(state.customDiets);
-        syncFailed = !ok;
+        const result = await pushSharedDiets(state.customDiets);
+        syncFailed = !result.ok;
+        syncErrorMsg = result.error || "";
       }
 
       state.loadError = failed.length
         ? `Não consegui ler: ${failed.join(", ")}. Confira se ${failed.length>1?'são':'é'} o mesmo modelo do programa.`
         : syncFailed
-          ? "Salvei aqui, mas não consegui sincronizar com os outros aparelhos agora. Tente de novo em instantes."
+          ? `Salvei aqui, mas não consegui sincronizar com os outros aparelhos agora (${syncErrorMsg}).`
           : null;
 
       state.loading = false;

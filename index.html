@@ -145,6 +145,23 @@ async function extractLinesViaOCR(pdf, onProgress){
     throw new Error("Tesseract.js não carregou (biblioteca de OCR indisponível — verifique a conexão ou se algum bloqueador de scripts está ativo).");
   }
   const numPages = pdf.numPages;
+
+  // Step 1 — render every page to a canvas ONE AT A TIME. pdf.js running in
+  // disableWorker mode is not safe for concurrent page.render() calls (they
+  // share internal state on the main thread), so rendering must stay
+  // sequential even though it's the fast part.
+  const canvases = [];
+  for (let p=1; p<=numPages; p++){
+    if (onProgress) onProgress({ status: `preparando página ${p}/${numPages}` });
+    try{
+      canvases.push(await renderPageToCanvas(pdf, p, 2.1));
+    } catch(err){
+      throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
+    }
+  }
+
+  // Step 2 — OCR is independent per image, so this part can safely run in
+  // parallel across several Tesseract workers to save time.
   const CONCURRENCY = Math.min(4, numPages);
   const results = new Array(numPages);
   let completed = 0;
@@ -158,31 +175,23 @@ async function extractLinesViaOCR(pdf, onProgress){
     throw new Error(`Falha ao iniciar o motor de OCR: ${err && err.message ? err.message : String(err)}`);
   }
 
-  // Simple shared queue: each worker keeps pulling the next page number
-  // until none are left, so all workers stay busy (round-robin split).
-  let nextPage = 1;
-  const takeNext = () => (nextPage <= numPages ? nextPage++ : null);
+  let nextIdx = 0;
+  const takeNext = () => (nextIdx < numPages ? nextIdx++ : null);
 
   async function runWorker(worker){
-    let p;
-    while ((p = takeNext()) !== null){
-      let canvas;
-      try{
-        canvas = await renderPageToCanvas(pdf, p, 2.1);
-      } catch(err){
-        throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
-      }
+    let idx;
+    while ((idx = takeNext()) !== null){
       let data;
       try{
-        const result = await worker.recognize(canvas);
+        const result = await worker.recognize(canvases[idx]);
         data = result.data;
       } catch(err){
-        throw new Error(`Falha no OCR da página ${p}: ${err && err.message ? err.message : String(err)}`);
+        throw new Error(`Falha no OCR da página ${idx+1}: ${err && err.message ? err.message : String(err)}`);
       }
       const words = (data.words || []).map(w => ({
         text: w.text, x: w.bbox.x0, x1: w.bbox.x1, y: (w.bbox.y0 + w.bbox.y1) / 2,
       })).filter(w => w.text && w.text.trim());
-      results[p - 1] = buildLinesFromItems(words, 12, 55);
+      results[idx] = buildLinesFromItems(words, 12, 55);
       completed++;
       if (onProgress) onProgress({ status: `ocr ${completed}/${numPages} páginas` });
     }

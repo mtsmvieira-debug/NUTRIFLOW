@@ -223,7 +223,15 @@ async function extractLinesFromPdf(file, onProgress){
 
 function parseDietText(allLines){
   const dayHeaderRegex = /^(Segunda-Feira|Segunda-feira|Terça-Feira|Terça-feira|Quarta-Feira|Quarta-feira|Quinta-Feira|Quinta-feira|Sexta-Feira|Sexta-feira|Sábado|Domingo)\s*\|\s*([\d.,]+)\s*calorias$/i;
-  const mealHeaderRegex = /^(Café da manhã|Almoço|Jantar)\s*(\(op[cç][aã]o\s*(\d)\))?\s*~\s*([\d.,]+)\s*Kcal$/i;
+  const mealHeaderRegexA = /^(Café da manhã|Almoço|Jantar)\s*(\(op[cç][aã]o\s*(\d)\))?\s*~\s*([\d.,]+)\s*Kcal$/i;
+  const mealHeaderRegexB = /^(Café da manhã|Almoço|Jantar)\s*-?\s*([\d.,]+)\s*Kcal\s*(\(op[cç][aã]o\s*(\d)\))?$/i;
+  function matchMealHeader(line){
+    let m = line.match(mealHeaderRegexA);
+    if (m) return { type: m[1], kcal: m[4], opt: m[3] };
+    m = line.match(mealHeaderRegexB);
+    if (m) return { type: m[1], kcal: m[2], opt: m[4] };
+    return null;
+  }
   const subHeaderRegex = /^•?\s*Op[cç][oõ]es de substitui[cç][aã]o para (.+):$/i;
   const dayNamesForFasting = ["Segunda-feira","Terça-feira","Quarta-feira","Quinta-feira","Sexta-feira","Sábado","Domingo"];
 
@@ -268,10 +276,10 @@ function parseDietText(allLines){
     }
     if (!curDayKey) continue;
 
-    const mh = l.match(mealHeaderRegex);
+    const mh = matchMealHeader(l);
     if (mh){
-      const type = mh[1].toLowerCase();
-      const kcalVal = parseInt(mh[4].replace(/\./g,""),10);
+      const type = mh.type.toLowerCase();
+      const kcalVal = parseInt(mh.kcal.replace(/\./g,""),10);
       if (type.startsWith("café")){
         menu[curDayKey].breakfast = { kcal:kcalVal, items:[] };
         curMeal = menu[curDayKey].breakfast;
@@ -279,7 +287,7 @@ function parseDietText(allLines){
         menu[curDayKey].lunch = { kcal:kcalVal, items:[] };
         curMeal = menu[curDayKey].lunch;
       } else if (type.startsWith("jantar")){
-        const opt = { label: mh[3] ? `Opção ${mh[3]}` : `Opção ${menu[curDayKey].dinner.length+1}`, kcal:kcalVal, items:[] };
+        const opt = { label: mh.opt ? `Opção ${mh.opt}` : `Opção ${menu[curDayKey].dinner.length+1}`, kcal:kcalVal, items:[] };
         menu[curDayKey].dinner.push(opt);
         curMeal = opt;
       }
@@ -1173,6 +1181,7 @@ const state = {
   inputTime: (() => { const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; })(),
   isAdmin: false,
   showManage: false,
+  showManualImport: false,
 };
 
 /* ================= RENDER ================= */
@@ -1317,6 +1326,16 @@ function dietSelectorHtml(){
           </div>` : ''}
         <div class="card" style="margin-top:8px;padding:14px;">
           <button class="btn" data-action="open-upload" style="width:100%;margin-bottom:10px;display:flex;align-items:center;justify-content:center;gap:8px;">${state.loading?`<span class="spinner"></span> ${state.loadProgress||''}`:'+ Adicionar PDFs'}</button>
+          <div style="margin-bottom:10px;">
+            <span class="muted" style="font-size:12.5px;cursor:pointer;text-decoration:underline dotted;" data-action="toggle-manual-import">${state.showManualImport?'fechar importação manual':'importar dieta manualmente (colar JSON)'}</span>
+          </div>
+          ${state.showManualImport ? `
+            <div style="margin-bottom:10px;">
+              <p class="muted" style="font-size:12px;margin-bottom:6px;">Cole aqui o JSON que eu te mandar no chat (quando o PDF não puder ser lido automaticamente) e toque em Importar.</p>
+              <textarea id="manualImportBox" placeholder='{"kcal":"1300","period":"07/09 a 13/09","fasting":{...},"menu":{...}}' style="width:100%;height:110px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:11px;font-family:monospace;padding:8px;margin-bottom:8px;"></textarea>
+              <button class="btn" data-action="import-manual" style="width:100%;">Importar</button>
+            </div>
+          ` : ''}
           <div class="diet-manage" style="margin-top:0;">${kcalKeys.length} dieta(s) salva(s) · <span data-action="toggle-manage">gerenciar</span> · <span data-action="admin-logout">sair da área da administradora</span></div>
           ${state.showManage ? `<div style="margin-top:10px;">${kcalKeys.map(k=>`<div class="between" style="padding:6px 0;font-size:13.5px;border-top:1px solid var(--border);"><span>${Number(k).toLocaleString('pt-BR')} kcal — ${state.diets[k].stats.dayCount} dias lidos</span><span style="color:var(--accent);cursor:pointer;" data-action="remove-kcal" data-kcal="${k}">remover</span></div>`).join("")}</div>` : ''}
         </div>
@@ -1399,6 +1418,53 @@ function attachEvents(){
     } else if (action === "set-dinner-opt"){
       state.dinnerOptIdx[el.dataset.day] = Number(el.dataset.idx);
       render();
+    } else if (action === "toggle-manual-import"){
+      state.showManualImport = !state.showManualImport;
+      render();
+    } else if (action === "import-manual"){
+      const box = document.getElementById("manualImportBox");
+      const raw = box ? box.value.trim() : "";
+      if (!raw){ state.loadError = "Cole o JSON na caixa antes de importar."; render(); return; }
+      let parsed;
+      try{
+        parsed = JSON.parse(raw);
+      } catch(err){
+        state.loadError = `JSON inválido: ${err.message}`;
+        render();
+        return;
+      }
+      if (!parsed.kcal || !isValidKcalKey(String(parsed.kcal)) || !parsed.menu || Object.keys(parsed.menu).length === 0){
+        state.loadError = "Esse JSON não parece ter os campos esperados (kcal, menu preenchido).";
+        render();
+        return;
+      }
+      if (!parsed.fasting) parsed.fasting = FASTING_COMMON;
+      if (!parsed.period) parsed.period = PERIOD;
+      parsed.stats = statsFor(parsed.menu);
+      const kcalKey = String(parsed.kcal);
+
+      state.loading = true;
+      state.loadProgress = "importando…";
+      render();
+
+      await saveDiet(kcalKey, parsed);
+      state.customDiets[kcalKey] = parsed;
+      state.diets[kcalKey] = parsed;
+      state.selectedKcal = kcalKey;
+      await saveSelectedKcal(kcalKey);
+
+      let syncErr = "";
+      if (SHARED_SYNC_ENABLED){
+        const result = await pushSharedDiets(state.customDiets);
+        if (!result.ok) syncErr = ` (mas não sincronizou com os outros aparelhos: ${result.error})`;
+      }
+
+      state.loading = false;
+      state.loadProgress = "";
+      state.showManualImport = false;
+      state.loadError = null;
+      render();
+      window.alert(`Dieta de ${Number(kcalKey).toLocaleString('pt-BR')} kcal importada com sucesso!${syncErr}`);
     } else if (action === "select-day"){
       state.selectedDay = el.dataset.day;
       render();

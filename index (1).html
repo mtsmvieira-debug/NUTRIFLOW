@@ -145,51 +145,60 @@ async function extractLinesViaOCR(pdf, onProgress){
     throw new Error("Tesseract.js não carregou (biblioteca de OCR indisponível — verifique a conexão ou se algum bloqueador de scripts está ativo).");
   }
   const numPages = pdf.numPages;
-  const CONCURRENCY = Math.min(4, numPages);
+  const SCALE = 2.0;
+  const BATCH_SIZE = Math.min(4, numPages); // how many pages are held in memory at once
+
   const results = new Array(numPages);
   let completed = 0;
 
   let workers;
   try{
     workers = await Promise.all(
-      Array.from({ length: CONCURRENCY }, () => Tesseract.createWorker('por', 1))
+      Array.from({ length: BATCH_SIZE }, () => Tesseract.createWorker('por', 1))
     );
   } catch(err){
     throw new Error(`Falha ao iniciar o motor de OCR: ${err && err.message ? err.message : String(err)}`);
   }
 
-  // Simple shared queue: each worker keeps pulling the next page number
-  // until none are left, so all workers stay busy (round-robin split).
-  let nextPage = 1;
-  const takeNext = () => (nextPage <= numPages ? nextPage++ : null);
-
-  async function runWorker(worker){
-    let p;
-    while ((p = takeNext()) !== null){
-      let canvas;
-      try{
-        canvas = await renderPageToCanvas(pdf, p, 2.1);
-      } catch(err){
-        throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
-      }
-      let data;
-      try{
-        const result = await worker.recognize(canvas);
-        data = result.data;
-      } catch(err){
-        throw new Error(`Falha no OCR da página ${p}: ${err && err.message ? err.message : String(err)}`);
-      }
-      const words = (data.words || []).map(w => ({
-        text: w.text, x: w.bbox.x0, x1: w.bbox.x1, y: (w.bbox.y0 + w.bbox.y1) / 2,
-      })).filter(w => w.text && w.text.trim());
-      results[p - 1] = buildLinesFromItems(words, 12, 55);
-      completed++;
-      if (onProgress) onProgress({ status: `ocr ${completed}/${numPages} páginas` });
-    }
-  }
-
   try{
-    await Promise.all(workers.map(runWorker));
+    for (let start=1; start<=numPages; start+=BATCH_SIZE){
+      const end = Math.min(start + BATCH_SIZE - 1, numPages);
+
+      // Render only this small batch of pages to canvases, one at a time
+      // (pdf.js in disableWorker mode isn't safe for concurrent rendering).
+      const batchCanvases = [];
+      for (let p=start; p<=end; p++){
+        if (onProgress) onProgress({ status: `preparando página ${p}/${numPages}` });
+        try{
+          batchCanvases.push(await renderPageToCanvas(pdf, p, SCALE));
+        } catch(err){
+          throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
+        }
+      }
+
+      // OCR this batch in parallel (independent images, safe to parallelize).
+      await Promise.all(batchCanvases.map(async (canvas, i) => {
+        const pageNum = start + i;
+        const worker = workers[i % workers.length];
+        let data;
+        try{
+          const result = await worker.recognize(canvas);
+          data = result.data;
+        } catch(err){
+          throw new Error(`Falha no OCR da página ${pageNum}: ${err && err.message ? err.message : String(err)}`);
+        }
+        const words = (data.words || []).map(w => ({
+          text: w.text, x: w.bbox.x0, x1: w.bbox.x1, y: (w.bbox.y0 + w.bbox.y1) / 2,
+        })).filter(w => w.text && w.text.trim());
+        results[pageNum - 1] = buildLinesFromItems(words, 12, 55);
+        completed++;
+        if (onProgress) onProgress({ status: `ocr ${completed}/${numPages} páginas` });
+      }));
+
+      // Release this batch's canvases before moving on, so memory doesn't
+      // build up across a long document.
+      for (const c of batchCanvases){ c.width = 0; c.height = 0; }
+    }
   } finally {
     await Promise.all(workers.map(w => w.terminate().catch(()=>{})));
   }
@@ -214,7 +223,15 @@ async function extractLinesFromPdf(file, onProgress){
 
 function parseDietText(allLines){
   const dayHeaderRegex = /^(Segunda-Feira|Segunda-feira|Terça-Feira|Terça-feira|Quarta-Feira|Quarta-feira|Quinta-Feira|Quinta-feira|Sexta-Feira|Sexta-feira|Sábado|Domingo)\s*\|\s*([\d.,]+)\s*calorias$/i;
-  const mealHeaderRegex = /^(Café da manhã|Almoço|Jantar)\s*(\(op[cç][aã]o\s*(\d)\))?\s*~\s*([\d.,]+)\s*Kcal$/i;
+  const mealHeaderRegexA = /^(Café da manhã|Almoço|Jantar)\s*(\(op[cç][aã]o\s*(\d)\))?\s*~\s*([\d.,]+)\s*Kcal$/i;
+  const mealHeaderRegexB = /^(Café da manhã|Almoço|Jantar)\s*-?\s*([\d.,]+)\s*Kcal\s*(\(op[cç][aã]o\s*(\d)\))?$/i;
+  function matchMealHeader(line){
+    let m = line.match(mealHeaderRegexA);
+    if (m) return { type: m[1], kcal: m[4], opt: m[3] };
+    m = line.match(mealHeaderRegexB);
+    if (m) return { type: m[1], kcal: m[2], opt: m[4] };
+    return null;
+  }
   const subHeaderRegex = /^•?\s*Op[cç][oõ]es de substitui[cç][aã]o para (.+):$/i;
   const dayNamesForFasting = ["Segunda-feira","Terça-feira","Quarta-feira","Quinta-feira","Sexta-feira","Sábado","Domingo"];
 
@@ -259,10 +276,10 @@ function parseDietText(allLines){
     }
     if (!curDayKey) continue;
 
-    const mh = l.match(mealHeaderRegex);
+    const mh = matchMealHeader(l);
     if (mh){
-      const type = mh[1].toLowerCase();
-      const kcalVal = parseInt(mh[4].replace(/\./g,""),10);
+      const type = mh.type.toLowerCase();
+      const kcalVal = parseInt(mh.kcal.replace(/\./g,""),10);
       if (type.startsWith("café")){
         menu[curDayKey].breakfast = { kcal:kcalVal, items:[] };
         curMeal = menu[curDayKey].breakfast;
@@ -270,7 +287,7 @@ function parseDietText(allLines){
         menu[curDayKey].lunch = { kcal:kcalVal, items:[] };
         curMeal = menu[curDayKey].lunch;
       } else if (type.startsWith("jantar")){
-        const opt = { label: mh[3] ? `Opção ${mh[3]}` : `Opção ${menu[curDayKey].dinner.length+1}`, kcal:kcalVal, items:[] };
+        const opt = { label: mh.opt ? `Opção ${mh.opt}` : `Opção ${menu[curDayKey].dinner.length+1}`, kcal:kcalVal, items:[] };
         menu[curDayKey].dinner.push(opt);
         curMeal = opt;
       }

@@ -145,60 +145,60 @@ async function extractLinesViaOCR(pdf, onProgress){
     throw new Error("Tesseract.js não carregou (biblioteca de OCR indisponível — verifique a conexão ou se algum bloqueador de scripts está ativo).");
   }
   const numPages = pdf.numPages;
+  const SCALE = 2.0;
+  const BATCH_SIZE = Math.min(4, numPages); // how many pages are held in memory at once
 
-  // Step 1 — render every page to a canvas ONE AT A TIME. pdf.js running in
-  // disableWorker mode is not safe for concurrent page.render() calls (they
-  // share internal state on the main thread), so rendering must stay
-  // sequential even though it's the fast part.
-  const canvases = [];
-  for (let p=1; p<=numPages; p++){
-    if (onProgress) onProgress({ status: `preparando página ${p}/${numPages}` });
-    try{
-      canvases.push(await renderPageToCanvas(pdf, p, 2.1));
-    } catch(err){
-      throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
-    }
-  }
-
-  // Step 2 — OCR is independent per image, so this part can safely run in
-  // parallel across several Tesseract workers to save time.
-  const CONCURRENCY = Math.min(4, numPages);
   const results = new Array(numPages);
   let completed = 0;
 
   let workers;
   try{
     workers = await Promise.all(
-      Array.from({ length: CONCURRENCY }, () => Tesseract.createWorker('por', 1))
+      Array.from({ length: BATCH_SIZE }, () => Tesseract.createWorker('por', 1))
     );
   } catch(err){
     throw new Error(`Falha ao iniciar o motor de OCR: ${err && err.message ? err.message : String(err)}`);
   }
 
-  let nextIdx = 0;
-  const takeNext = () => (nextIdx < numPages ? nextIdx++ : null);
-
-  async function runWorker(worker){
-    let idx;
-    while ((idx = takeNext()) !== null){
-      let data;
-      try{
-        const result = await worker.recognize(canvases[idx]);
-        data = result.data;
-      } catch(err){
-        throw new Error(`Falha no OCR da página ${idx+1}: ${err && err.message ? err.message : String(err)}`);
-      }
-      const words = (data.words || []).map(w => ({
-        text: w.text, x: w.bbox.x0, x1: w.bbox.x1, y: (w.bbox.y0 + w.bbox.y1) / 2,
-      })).filter(w => w.text && w.text.trim());
-      results[idx] = buildLinesFromItems(words, 12, 55);
-      completed++;
-      if (onProgress) onProgress({ status: `ocr ${completed}/${numPages} páginas` });
-    }
-  }
-
   try{
-    await Promise.all(workers.map(runWorker));
+    for (let start=1; start<=numPages; start+=BATCH_SIZE){
+      const end = Math.min(start + BATCH_SIZE - 1, numPages);
+
+      // Render only this small batch of pages to canvases, one at a time
+      // (pdf.js in disableWorker mode isn't safe for concurrent rendering).
+      const batchCanvases = [];
+      for (let p=start; p<=end; p++){
+        if (onProgress) onProgress({ status: `preparando página ${p}/${numPages}` });
+        try{
+          batchCanvases.push(await renderPageToCanvas(pdf, p, SCALE));
+        } catch(err){
+          throw new Error(`Falha ao renderizar a página ${p}: ${err && err.message ? err.message : String(err)}`);
+        }
+      }
+
+      // OCR this batch in parallel (independent images, safe to parallelize).
+      await Promise.all(batchCanvases.map(async (canvas, i) => {
+        const pageNum = start + i;
+        const worker = workers[i % workers.length];
+        let data;
+        try{
+          const result = await worker.recognize(canvas);
+          data = result.data;
+        } catch(err){
+          throw new Error(`Falha no OCR da página ${pageNum}: ${err && err.message ? err.message : String(err)}`);
+        }
+        const words = (data.words || []).map(w => ({
+          text: w.text, x: w.bbox.x0, x1: w.bbox.x1, y: (w.bbox.y0 + w.bbox.y1) / 2,
+        })).filter(w => w.text && w.text.trim());
+        results[pageNum - 1] = buildLinesFromItems(words, 12, 55);
+        completed++;
+        if (onProgress) onProgress({ status: `ocr ${completed}/${numPages} páginas` });
+      }));
+
+      // Release this batch's canvases before moving on, so memory doesn't
+      // build up across a long document.
+      for (const c of batchCanvases){ c.width = 0; c.height = 0; }
+    }
   } finally {
     await Promise.all(workers.map(w => w.terminate().catch(()=>{})));
   }

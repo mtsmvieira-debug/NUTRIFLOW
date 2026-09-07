@@ -1284,12 +1284,10 @@ function fastingCardHtml(){
 function dietSelectorHtml(){
   const kcalKeys = Object.keys(state.diets).filter(isValidKcalKey).sort((a,b)=>Number(a)-Number(b));
   const chips = kcalKeys.map(k => `<div class="chip ${state.selectedKcal===k?'active':''}" data-action="select-kcal" data-kcal="${k}">${Number(k).toLocaleString('pt-BR')} kcal</div>`).join("");
-  const uploadChip = state.isAdmin ? `<div class="chip dashed" data-action="open-upload">${state.loading?`<span class="spinner"></span> ${state.loadProgress||''}`:'+ Adicionar PDFs'}</div>` : '';
   return `
     <div>
       <div class="scrollrow" style="margin-bottom:8px;">
         ${chips}
-        ${uploadChip}
       </div>
       <input type="file" id="pdfInput" accept="application/pdf" multiple style="display:none;" />
       ${state.isAdmin ? `
@@ -1308,8 +1306,11 @@ function dietSelectorHtml(){
                 <textarea readonly style="width:100%;height:90px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:11px;font-family:monospace;padding:8px;" onclick="this.select()">${escapeHtml(state.debugDumps[name].slice(0,4000))}</textarea>
               </div>`).join("")}
           </div>` : ''}
-        <div class="diet-manage">${kcalKeys.length} dieta(s) salva(s) · <span data-action="toggle-manage">gerenciar</span> · <span data-action="admin-logout">sair da área da administradora</span></div>
-        ${state.showManage ? `<div class="card" style="margin-top:8px;">${kcalKeys.map(k=>`<div class="between" style="padding:6px 0;font-size:13.5px;"><span>${Number(k).toLocaleString('pt-BR')} kcal — ${state.diets[k].stats.dayCount} dias lidos</span><span style="color:var(--accent);cursor:pointer;" data-action="remove-kcal" data-kcal="${k}">remover</span></div>`).join("")}</div>` : ''}
+        <div class="card" style="margin-top:8px;padding:14px;">
+          <button class="btn" data-action="open-upload" style="width:100%;margin-bottom:10px;display:flex;align-items:center;justify-content:center;gap:8px;">${state.loading?`<span class="spinner"></span> ${state.loadProgress||''}`:'+ Adicionar PDFs'}</button>
+          <div class="diet-manage" style="margin-top:0;">${kcalKeys.length} dieta(s) salva(s) · <span data-action="toggle-manage">gerenciar</span> · <span data-action="admin-logout">sair da área da administradora</span></div>
+          ${state.showManage ? `<div style="margin-top:10px;">${kcalKeys.map(k=>`<div class="between" style="padding:6px 0;font-size:13.5px;border-top:1px solid var(--border);"><span>${Number(k).toLocaleString('pt-BR')} kcal — ${state.diets[k].stats.dayCount} dias lidos</span><span style="color:var(--accent);cursor:pointer;" data-action="remove-kcal" data-kcal="${k}">remover</span></div>`).join("")}</div>` : ''}
+        </div>
       ` : ''}
     </div>`;
 }

@@ -366,41 +366,93 @@ function isValidKcalKey(k){
   return /^\d+$/.test(k) && Number.isFinite(Number(k)) && Number(k) > 0;
 }
 
+// The JSONBin content holds both the custom diets (numeric kcal keys, at the
+// top level, kept as-is for backward compatibility) AND the approved-users
+// list (under the "_users" key, ignored by isValidKcalKey so it never shows
+// up as a diet). lastKnownRaw caches the last object we saw so a write to
+// one section doesn't accidentally wipe out the other.
+let lastKnownRaw = null;
+
+async function fetchBinRaw(){
+  const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}/latest`, {
+    headers: { 'X-Master-Key': JSONBIN_KEY }
+  });
+  if (!res.ok){
+    let bodyText = '';
+    try{ bodyText = await res.text(); }catch(e2){}
+    throw new Error(`status ${res.status}${bodyText ? ' — ' + bodyText.slice(0,200) : ''}`);
+  }
+  const json = await res.json();
+  const record = (json && json.record) ? json.record : {};
+  lastKnownRaw = record;
+  return record;
+}
+
+async function pushBinRaw(record){
+  const payload = Object.keys(record).length > 0 ? record : { _empty: true };
+  const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
+    method: 'PUT',
+    headers: { 'Content-Type':'application/json', 'X-Master-Key': JSONBIN_KEY },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok){
+    let bodyText = '';
+    try{ bodyText = await res.text(); }catch(e2){}
+    throw new Error(`status ${res.status}${bodyText ? ' — ' + bodyText.slice(0,200) : ''}`);
+  }
+  lastKnownRaw = record;
+}
+
 async function fetchSharedDiets(){
-  if (!SHARED_SYNC_ENABLED) return null;
+  if (!SHARED_SYNC_ENABLED) return { diets:null, error:null };
   try{
-    const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}/latest`, {
-      headers: { 'X-Master-Key': JSONBIN_KEY }
-    });
-    if (!res.ok) throw new Error('status ' + res.status);
-    const json = await res.json();
-    const record = (json && json.record) ? json.record : {};
+    const record = await fetchBinRaw();
     const clean = {};
     for (const k of Object.keys(record)){ if (isValidKcalKey(k)) clean[k] = record[k]; }
-    return clean;
+    return { diets: clean, error: null };
   } catch(e){
     console.error('Falha ao buscar dietas compartilhadas', e);
-    return null;
+    return { diets:null, error: (e && e.message) ? e.message : String(e) };
   }
 }
 
 async function pushSharedDiets(customDiets){
   if (!SHARED_SYNC_ENABLED) return { ok:true };
-  const payload = Object.keys(customDiets).length > 0 ? customDiets : { _empty: true };
   try{
-    const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
-      method: 'PUT',
-      headers: { 'Content-Type':'application/json', 'X-Master-Key': JSONBIN_KEY },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok){
-      let bodyText = '';
-      try{ bodyText = await res.text(); }catch(e2){}
-      throw new Error(`status ${res.status}${bodyText ? ' — ' + bodyText.slice(0,200) : ''}`);
-    }
+    const existingUsers = (lastKnownRaw && lastKnownRaw._users) ? lastKnownRaw._users : undefined;
+    const payload = { ...customDiets };
+    if (existingUsers) payload._users = existingUsers;
+    await pushBinRaw(payload);
     return { ok:true };
   } catch(e){
     console.error('Falha ao sincronizar dietas com todos', e);
+    return { ok:false, error: (e && e.message) ? e.message : String(e) };
+  }
+}
+
+async function fetchSharedUsers(){
+  if (!SHARED_SYNC_ENABLED) return { users:null, error:null };
+  try{
+    const record = await fetchBinRaw();
+    return { users: record._users || {}, error: null };
+  } catch(e){
+    console.error('Falha ao buscar usuários liberados', e);
+    return { users:null, error: (e && e.message) ? e.message : String(e) };
+  }
+}
+
+async function pushSharedUsers(usersObj){
+  if (!SHARED_SYNC_ENABLED) return { ok:true };
+  try{
+    const dietsPortion = {};
+    if (lastKnownRaw){
+      for (const k of Object.keys(lastKnownRaw)){ if (isValidKcalKey(k)) dietsPortion[k] = lastKnownRaw[k]; }
+    }
+    const payload = { ...dietsPortion, _users: usersObj };
+    await pushBinRaw(payload);
+    return { ok:true };
+  } catch(e){
+    console.error('Falha ao sincronizar usuários liberados', e);
     return { ok:false, error: (e && e.message) ? e.message : String(e) };
   }
 }
@@ -1182,6 +1234,12 @@ const state = {
   isAdmin: false,
   showManage: false,
   showManualImport: false,
+  authorized: false,     // gate for the whole app — nobody sees content without this
+  authName: null,
+  authChecking: true,    // true while we're validating the stored login on startup
+  loginError: null,
+  approvedUsers: {},     // { name: code } — synced from the shared bin, managed by admin
+  showManageUsers: false,
 };
 
 /* ================= RENDER ================= */
@@ -1310,6 +1368,7 @@ function dietSelectorHtml(){
       <input type="file" id="pdfInput" accept="application/pdf" multiple style="display:none;" />
       ${state.isAdmin ? `
         ${!SHARED_SYNC_ENABLED ? `<p class="muted" style="font-size:11.5px;margin:4px 0 0;">Sincronização com outros aparelhos ainda não configurada (JSONBIN_ID/JSONBIN_KEY vazios no código).</p>` : ''}
+        ${state.syncOnLoadError ? `<p style="color:var(--accent);font-size:12px;margin:4px 0 0;">Não consegui buscar as dietas compartilhadas ao abrir o app (${escapeHtml(state.syncOnLoadError)}). Mostrando a versão salva neste aparelho.</p>` : ''}
         ${state.loadError ? `<p style="color:var(--accent);font-size:12.5px;margin:4px 0 0;">${escapeHtml(state.loadError)}</p>` : ''}
         ${state.loading ? `<p class="muted" style="font-size:11.5px;margin:4px 0 0;">Se o PDF não tiver texto selecionável, o app lê por OCR (imagem) — pode levar de 30s a 2min por arquivo.</p>` : ''}
         ${state.debugDumps && Object.keys(state.debugDumps).length > 0 ? `
@@ -1343,7 +1402,32 @@ function dietSelectorHtml(){
     </div>`;
 }
 
+function loginScreenHtml(){
+  return `
+    <div style="min-height:80vh;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:20px 0;">
+      <img src="${LOGO_DATA_URI_PLACEHOLDER}" alt="NutriFlow" style="width:70%;max-width:240px;margin-bottom:22px;" />
+      <div class="card" style="width:100%;max-width:340px;">
+        <h2 style="font-size:19px;margin-bottom:4px;">Entrar</h2>
+        <p class="muted" style="font-size:13px;margin-bottom:16px;">Peça seu nome e código de acesso pra administradora do grupo.</p>
+        ${state.authChecking ? `<p class="muted" style="font-size:13px;">Verificando...</p>` : `
+          <div style="margin-bottom:10px;">
+            <input type="text" id="loginNameInput" placeholder="Seu nome" style="width:100%;margin-bottom:8px;" />
+            <input type="password" id="loginCodeInput" placeholder="Código de acesso" style="width:100%;" />
+          </div>
+          ${state.loginError ? `<p style="color:var(--accent);font-size:12.5px;margin-bottom:10px;">${escapeHtml(state.loginError)}</p>` : ''}
+          <button class="btn" data-action="do-login" style="width:100%;">Entrar</button>
+        `}
+      </div>
+    </div>`;
+}
+
 function render(){
+  if (!state.authorized){
+    document.getElementById("app").innerHTML = loginScreenHtml();
+    attachEvents();
+    return;
+  }
+
   const diet = state.selectedKcal ? state.diets[state.selectedKcal] : null;
   const hasAnyDiet = Object.keys(state.diets).length > 0;
 
@@ -1397,7 +1481,8 @@ function render(){
       <div style="display:flex;flex-direction:column;gap:12px;">${mealsHtml}</div>
     `}
 
-    <p class="footnote">Toque num alimento com seta pra ver as substituições. As 4 dietas desta semana (31/08 a 06/09) já estão carregadas — quando chegar a próxima semana, use "+ Adicionar PDFs" pra atualizar (se o PDF tiver texto selecionável) ou me traga o conteúdo aqui no chat.</p>
+    <p class="footnote" style="font-family:Fraunces,serif;font-size:15px;font-weight:600;color:var(--text);margin-top:28px;">Ótima semana! 🌿</p>
+    <p class="footnote" style="margin-top:4px;">Programa de Ana Cristina Bunn</p>
     ${!state.isAdmin ? `<p class="footnote" style="margin-top:6px;"><span data-action="admin-login" style="cursor:pointer;text-decoration:underline dotted;">área da administradora</span></p>` : ''}
   `;
 
@@ -1620,12 +1705,15 @@ function attachEvents(){
 
   // Then refresh with whatever the shared database has (may be newer than this
   // device's local cache — e.g. another device uploaded a new week's PDF).
-  const shared = await fetchSharedDiets();
-  if (shared){
-    state.customDiets = shared;
+  const sharedResult = await fetchSharedDiets();
+  if (sharedResult.diets){
+    state.customDiets = sharedResult.diets;
     state.diets = { ...BUILTIN_DIETS, ...state.customDiets };
-    for (const k of Object.keys(shared)){ await saveDiet(k, shared[k]); } // refresh local cache
+    for (const k of Object.keys(sharedResult.diets)){ await saveDiet(k, sharedResult.diets[k]); } // refresh local cache
     if (state.selectedKcal && !state.diets[state.selectedKcal]) state.selectedKcal = "1300";
+    render();
+  } else if (sharedResult.error){
+    state.syncOnLoadError = sharedResult.error;
     render();
   }
 

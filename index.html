@@ -1402,32 +1402,7 @@ function dietSelectorHtml(){
     </div>`;
 }
 
-function loginScreenHtml(){
-  return `
-    <div style="min-height:80vh;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:20px 0;">
-      <img src="${LOGO_DATA_URI_PLACEHOLDER}" alt="NutriFlow" style="width:70%;max-width:240px;margin-bottom:22px;" />
-      <div class="card" style="width:100%;max-width:340px;">
-        <h2 style="font-size:19px;margin-bottom:4px;">Entrar</h2>
-        <p class="muted" style="font-size:13px;margin-bottom:16px;">Peça seu nome e código de acesso pra administradora do grupo.</p>
-        ${state.authChecking ? `<p class="muted" style="font-size:13px;">Verificando...</p>` : `
-          <div style="margin-bottom:10px;">
-            <input type="text" id="loginNameInput" placeholder="Seu nome" style="width:100%;margin-bottom:8px;" />
-            <input type="password" id="loginCodeInput" placeholder="Código de acesso" style="width:100%;" />
-          </div>
-          ${state.loginError ? `<p style="color:var(--accent);font-size:12.5px;margin-bottom:10px;">${escapeHtml(state.loginError)}</p>` : ''}
-          <button class="btn" data-action="do-login" style="width:100%;">Entrar</button>
-        `}
-      </div>
-    </div>`;
-}
-
 function render(){
-  if (!state.authorized){
-    document.getElementById("app").innerHTML = loginScreenHtml();
-    attachEvents();
-    return;
-  }
-
   const diet = state.selectedKcal ? state.diets[state.selectedKcal] : null;
   const hasAnyDiet = Object.keys(state.diets).length > 0;
 

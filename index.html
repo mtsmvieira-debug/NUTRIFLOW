@@ -1217,6 +1217,18 @@ async function saveLastMeal(entry){
 async function clearLastMeal(){
   try{ localStorage.removeItem("lastMeal"); }catch(e){}
 }
+async function loadSubSelections(){
+  try{ const v = localStorage.getItem("subSelections"); return v ? JSON.parse(v) : {}; }catch(e){ return {}; }
+}
+async function saveSubSelections(obj){
+  try{ localStorage.setItem("subSelections", JSON.stringify(obj)); }catch(e){}
+}
+async function loadMealsDone(){
+  try{ const v = localStorage.getItem("mealsDone"); return v ? JSON.parse(v) : {}; }catch(e){ return {}; }
+}
+async function saveMealsDone(obj){
+  try{ localStorage.setItem("mealsDone", JSON.stringify(obj)); }catch(e){}
+}
 
 /* ================= STATE ================= */
 const state = {
@@ -1230,7 +1242,10 @@ const state = {
   loadError: null,
   openFood: {},        // id -> bool (expanded substitutions)
   dinnerOptIdx: {},    // dayKey -> index
+  selectedSubs: {},    // foodId -> index of the option (0=original food, 1+=substitutions) she wants shown first
+  mealsDone: {},        // "period::mealId" -> bool (checked off as eaten)
   inputTime: (() => { const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; })(),
+  inputDate: todayKey(),
   isAdmin: false,
   showManage: false,
   showManualImport: false,
@@ -1238,37 +1253,63 @@ const state = {
   authName: null,
   authChecking: true,    // true while we're validating the stored login on startup
   loginError: null,
+  loginBusy: false,
+  loginNameDraft: "",
   approvedUsers: {},     // { name: code } — synced from the shared bin, managed by admin
   showManageUsers: false,
+  usersError: null,
+  confirmRemoveUser: null,
+  showAdminPasswordBox: false,
+  adminLoginError: null,
 };
 
 /* ================= RENDER ================= */
 function foodRowHtml(item, idKey){
-  const hasSubs = item.subs && item.subs.length > 0;
+  // All options for this food slot: the original item plus each substitution.
+  // She can tap any of them to make it the one shown up front; the rest stay
+  // listed below as "pode trocar por" so nothing is lost.
+  const options = [
+    { name: item.food, qty: item.qty, kcal: item.kcal },
+    ...(item.subs || []).map(s => ({ name: s.name, qty: s.qty, kcal: s.kcal })),
+  ];
+  const hasSubs = options.length > 1;
+  const selIdx = Math.min(state.selectedSubs[idKey] || 0, options.length - 1);
+  const current = options[selIdx];
   const open = !!state.openFood[idKey];
+  const kcalSuffix = (o) => (o.kcal != null && o.kcal !== '') ? ` · ${o.kcal} kcal` : '';
   return `
-    <div class="foodrow ${hasSubs?'has-subs':''}" ${hasSubs?`data-action="toggle-food" data-id="${idKey}"`:''}>
+    <div class="foodrow ${hasSubs?'has-subs':''}">
       <div class="between">
-        <div style="flex:1;min-width:0;">
-          <div class="foodname">${escapeHtml(item.food)}</div>
-          <div class="foodqty">${escapeHtml(item.qty)}</div>
+        <div style="flex:1;min-width:0;${hasSubs?'cursor:pointer;':''}" ${hasSubs?`data-action="toggle-food" data-id="${idKey}"`:''}>
+          <div class="foodname">${escapeHtml(current.name)}${selIdx!==0?' <span style="color:var(--accent);font-size:11px;font-weight:600;">(substituição)</span>':''}</div>
+          <div class="foodqty">${escapeHtml(current.qty)}${kcalSuffix(current)}</div>
         </div>
-        ${hasSubs?`<svg class="chev ${open?'open':''}" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>`:''}
+        ${hasSubs?`<svg class="chev ${open?'open':''}" data-action="toggle-food" data-id="${idKey}" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>`:''}
       </div>
       ${hasSubs && open ? `
         <div class="subs">
-          <div class="sublabel">Pode trocar por</div>
-          ${item.subs.map(s => `<div class="subitem"><span>${escapeHtml(s.name)}</span><span class="qty">${escapeHtml(s.qty)}</span></div>`).join("")}
+          <div class="sublabel">Toque pra deixar essa na frente</div>
+          ${options.map((o,i) => i===selIdx ? '' : `<div class="subitem" data-action="select-sub" data-id="${idKey}" data-idx="${i}" style="cursor:pointer;padding:5px 0;"><span>${escapeHtml(o.name)}</span><span class="qty">${escapeHtml(o.qty)}${kcalSuffix(o)}</span></div>`).join("")}
         </div>` : ''}
     </div>`;
 }
 
+function doneCheckboxHtml(doneKey, done){
+  return `<span data-action="toggle-meal-done" data-key="${escapeHtml(doneKey)}" title="Marcar como feito" style="cursor:pointer;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:7px;border:1.5px solid ${done?'var(--mint)':'var(--border)'};background:${done?'var(--mint)':'transparent'};">${done?'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg>':''}</span>`;
+}
+
 function mealBlockHtml(title, option, idPrefix){
   if (!option) return `<div class="card"><div class="section-title"><h3 style="font-size:17px;">${title}</h3></div><p class="muted" style="font-size:13.5px;">Não encontrado nesse PDF.</p></div>`;
+  const diet = state.selectedKcal ? state.diets[state.selectedKcal] : null;
+  const doneKey = `${diet && diet.period ? diet.period : ''}::${idPrefix}`;
+  const done = !!state.mealsDone[doneKey];
   return `
-    <div class="card">
+    <div class="card" style="${done?'opacity:.55;':''}">
       <div class="between" style="margin-bottom:4px;">
-        <h3 style="font-size:17px;">${title}</h3>
+        <div class="row" style="gap:10px;">
+          ${doneCheckboxHtml(doneKey, done)}
+          <h3 style="font-size:17px;${done?'text-decoration:line-through;':''}">${title}</h3>
+        </div>
         <span class="kcaltag">~${option.kcal} kcal</span>
       </div>
       <div>${option.items.map((it,i) => foodRowHtml(it, `${idPrefix}-${i}`)).join("")}</div>
@@ -1279,15 +1320,27 @@ function mealWithOptionsHtml(title, options, dayKey){
   if (!options || options.length === 0) return mealBlockHtml(title, null, `${dayKey}-jantar`);
   const idx = state.dinnerOptIdx[dayKey] || 0;
   const option = options[Math.min(idx, options.length-1)];
+  const diet = state.selectedKcal ? state.diets[state.selectedKcal] : null;
+  const doneKey = `${diet && diet.period ? diet.period : ''}::${dayKey}-jantar`;
+  const done = !!state.mealsDone[doneKey];
   return `
-    <div class="card">
+    <div class="card" style="${done?'opacity:.55;':''}">
       <div class="between" style="margin-bottom:12px;">
-        <h3 style="font-size:17px;">${title}</h3>
+        <div class="row" style="gap:10px;">
+          ${doneCheckboxHtml(doneKey, done)}
+          <h3 style="font-size:17px;${done?'text-decoration:line-through;':''}">${title}</h3>
+        </div>
         <span class="kcaltag">~${option.kcal} kcal</span>
       </div>
       ${options.length>1 ? `<div class="opt-toggle">${options.map((o,i)=>`<button class="opt-btn ${i===idx?'active':''}" data-action="set-dinner-opt" data-day="${dayKey}" data-idx="${i}">${escapeHtml(o.label)}</button>`).join("")}</div>` : ''}
       <div>${option.items.map((it,i) => foodRowHtml(it, `${dayKey}-jantar-${idx}-${i}`)).join("")}</div>
     </div>`;
+}
+
+function offsetDateKey(offsetDays){
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 }
 
 function dayAfter(date){
@@ -1321,12 +1374,21 @@ function fastingCardHtml(){
   } else if (!target){
     body = `<p class="muted" style="font-size:14px;">Não encontrei a meta de jejum de ${DAY_LABEL[targetDayKey]} nesse PDF.</p>`;
   } else if (!lastMealDate){
+    const dKey = state.inputDate || todayKey();
+    const isToday = dKey === todayKey();
+    const isYesterday = dKey === offsetDateKey(-1);
     body = `
-      <p class="muted" style="font-size:14px;margin-bottom:12px;">Registre o horário da sua última refeição pra acompanhar o jejum.</p>
-      <div class="row">
-        <input type="time" id="mealTimeInput" value="${state.inputTime}" style="flex:1;" />
-        <button class="btn" data-action="register-meal">Registrar</button>
-      </div>`;
+      <p class="muted" style="font-size:14px;margin-bottom:10px;">Registre quando foi sua última refeição pra acompanhar o jejum.</p>
+      <div class="row" style="gap:8px;margin-bottom:10px;">
+        <div class="chip ${isToday?'active':''}" data-action="quick-date" data-key="${todayKey()}" style="flex:1;text-align:center;">Hoje</div>
+        <div class="chip ${isYesterday?'active':''}" data-action="quick-date" data-key="${offsetDateKey(-1)}" style="flex:1;text-align:center;">Ontem</div>
+        <input type="time" id="mealTimeInput" value="${state.inputTime}" style="flex:1;min-width:0;" />
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-bottom:4px;">
+        <label for="mealDateInput" class="muted" style="font-size:12.5px;margin-right:6px;">outro dia:</label>
+        <input type="date" id="mealDateInput" value="${dKey}" max="${todayKey()}" style="font-size:12.5px;color:var(--muted);background:transparent;border:none;border-bottom:1px dashed var(--border);border-radius:0;padding:2px 2px;width:auto;" />
+      </div>
+      <button class="btn" data-action="register-meal" style="width:100%;margin-top:6px;">Registrar</button>`;
   } else {
     const elapsedMs = state.now - lastMealDate;
     const elapsedH = Math.max(0, Math.floor(elapsedMs/3600000));
@@ -1397,12 +1459,63 @@ function dietSelectorHtml(){
           ` : ''}
           <div class="diet-manage" style="margin-top:0;">${kcalKeys.length} dieta(s) salva(s) · <span data-action="toggle-manage">gerenciar</span> · <span data-action="admin-logout">sair da área da administradora</span></div>
           ${state.showManage ? `<div style="margin-top:10px;">${kcalKeys.map(k=>`<div class="between" style="padding:6px 0;font-size:13.5px;border-top:1px solid var(--border);"><span>${Number(k).toLocaleString('pt-BR')} kcal — ${state.diets[k].stats.dayCount} dias lidos</span><span style="color:var(--accent);cursor:pointer;" data-action="remove-kcal" data-kcal="${k}">remover</span></div>`).join("")}</div>` : ''}
+          <div class="diet-manage" style="margin-top:10px;">${Object.keys(state.approvedUsers||{}).length} pessoa(s) liberada(s) · <span data-action="toggle-manage-users">${state.showManageUsers?'fechar acessos':'gerenciar acessos'}</span></div>
+          ${state.showManageUsers ? `
+            <div style="margin-top:10px;">
+              ${!SHARED_SYNC_ENABLED ? `<p class="muted" style="font-size:11.5px;margin:0 0 8px;">Sincronização com outros aparelhos ainda não configurada, então os logins não vão funcionar entre aparelhos diferentes.</p>` : ''}
+              <div style="display:flex;gap:6px;margin-bottom:10px;">
+                <input id="newUserName" type="text" placeholder="Nome" style="flex:1;min-width:0;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;" />
+                <input id="newUserCode" type="text" placeholder="Código" style="width:96px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;" />
+                <button class="btn" data-action="add-user" style="padding:8px 12px;">+</button>
+              </div>
+              ${state.usersError ? `<p style="color:var(--accent);font-size:12px;margin:0 0 8px;">${escapeHtml(state.usersError)}</p>` : ''}
+              ${Object.keys(state.approvedUsers||{}).length === 0 ? `<p class="muted" style="font-size:12.5px;">Ninguém liberado ainda.</p>` : Object.keys(state.approvedUsers).map(name => `<div class="between" style="padding:6px 0;font-size:13.5px;border-top:1px solid var(--border);"><span>${escapeHtml(name)}</span><span style="color:var(--accent);cursor:pointer;" data-action="remove-user" data-name="${escapeHtml(name)}">${state.confirmRemoveUser===name?'toque p/ confirmar':'remover'}</span></div>`).join("")}
+            </div>` : ''}
         </div>
       ` : ''}
     </div>`;
 }
 
+function adminLoginBoxHtml(){
+  if (!state.showAdminPasswordBox){
+    return `<span data-action="admin-login-toggle" style="cursor:pointer;text-decoration:underline dotted;">área da administradora</span>`;
+  }
+  return `
+    <div style="max-width:280px;margin:0 auto;text-align:left;">
+      <input id="adminPasswordInput" type="password" placeholder="Senha da administradora" autofocus
+        onkeydown="if(event.key==='Enter'){event.preventDefault();document.querySelector('[data-action=admin-login-submit]').click();}"
+        style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px;margin-bottom:8px;box-sizing:border-box;" />
+      ${state.adminLoginError ? `<p style="color:var(--accent);font-size:12.5px;margin:0 0 8px;">${escapeHtml(state.adminLoginError)}</p>` : ''}
+      <button class="btn" data-action="admin-login-submit" style="width:100%;">Entrar</button>
+    </div>`;
+}
+
+function loginScreenHtml(){
+  return `
+    <div style="max-width:360px;margin:16vh auto 0;padding:0 20px;text-align:center;">
+      <div class="eyebrow" style="margin-bottom:6px;">NUTRIFLOW</div>
+      <h1 class="title" style="margin-bottom:6px;">Bem-vinda!</h1>
+      <p class="muted" style="font-size:14px;margin-bottom:26px;">Digite seu nome e o código de acesso que a Ana Cristina te enviou.</p>
+      <div style="display:flex;flex-direction:column;gap:12px;text-align:left;">
+        <input id="loginNameInput" type="text" placeholder="Seu nome" autocomplete="name" style="width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:15px;" value="${escapeHtml(state.loginNameDraft||'')}" />
+        <input id="loginCodeInput" type="text" placeholder="Código de acesso" autocomplete="off" style="width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:15px;" />
+        ${state.loginError ? `<p style="color:var(--accent);font-size:13px;margin:0;">${escapeHtml(state.loginError)}</p>` : ''}
+        <button class="btn" data-action="do-login" style="width:100%;margin-top:4px;">${state.loginBusy?'Entrando…':'Entrar'}</button>
+      </div>
+      ${!SHARED_SYNC_ENABLED ? `<p class="muted" style="font-size:11.5px;margin-top:20px;">Aviso: sincronização compartilhada não configurada — o login por código não vai funcionar até isso ser corrigido.</p>` : ''}
+      <p class="footnote" style="margin-top:26px;">${adminLoginBoxHtml()}</p>
+    </div>`;
+}
+
 function render(){
+  if (state.authChecking){
+    document.getElementById("app").innerHTML = `<div style="text-align:center;margin-top:40vh;color:var(--muted);">Carregando…</div>`;
+    return;
+  }
+  if (!state.authorized){
+    document.getElementById("app").innerHTML = loginScreenHtml();
+    return;
+  }
   const diet = state.selectedKcal ? state.diets[state.selectedKcal] : null;
   const hasAnyDiet = Object.keys(state.diets).length > 0;
 
@@ -1458,7 +1571,7 @@ function render(){
 
     <p class="footnote" style="font-family:Fraunces,serif;font-size:15px;font-weight:600;color:var(--text);margin-top:28px;">Ótima semana! 🌿</p>
     <p class="footnote" style="margin-top:4px;">Programa de Ana Cristina Bunn</p>
-    ${!state.isAdmin ? `<p class="footnote" style="margin-top:6px;"><span data-action="admin-login" style="cursor:pointer;text-decoration:underline dotted;">área da administradora</span></p>` : ''}
+    ${!state.isAdmin ? `<p class="footnote" style="margin-top:6px;">${adminLoginBoxHtml()}</p>` : ''}
   `;
 
   attachEvents();
@@ -1466,6 +1579,12 @@ function render(){
 
 /* ================= EVENTS ================= */
 function attachEvents(){
+  document.getElementById("app").oninput = (e) => {
+    if (e.target && e.target.id === "mealDateInput" && e.target.value){
+      state.inputDate = e.target.value;
+    }
+  };
+
   document.getElementById("app").onclick = async (e) => {
     const el = e.target.closest("[data-action]");
     if (!el) return;
@@ -1474,6 +1593,17 @@ function attachEvents(){
     if (action === "toggle-food"){
       const id = el.dataset.id;
       state.openFood[id] = !state.openFood[id];
+      render();
+    } else if (action === "select-sub"){
+      const id = el.dataset.id;
+      state.selectedSubs[id] = Number(el.dataset.idx);
+      state.openFood[id] = false;
+      await saveSubSelections(state.selectedSubs);
+      render();
+    } else if (action === "toggle-meal-done"){
+      const key = el.dataset.key;
+      state.mealsDone[key] = !state.mealsDone[key];
+      await saveMealsDone(state.mealsDone);
       render();
     } else if (action === "set-dinner-opt"){
       state.dinnerOptIdx[el.dataset.day] = Number(el.dataset.idx);
@@ -1524,7 +1654,6 @@ function attachEvents(){
       state.showManualImport = false;
       state.loadError = null;
       render();
-      window.alert(`Dieta de ${Number(kcalKey).toLocaleString('pt-BR')} kcal importada com sucesso!${syncErr}`);
     } else if (action === "select-day"){
       state.selectedDay = el.dataset.day;
       render();
@@ -1547,14 +1676,22 @@ function attachEvents(){
       render();
       const result = await pushSharedDiets(state.customDiets);
       if (!result.ok && SHARED_SYNC_ENABLED){ state.loadError = `Removido aqui, mas não consegui sincronizar com os outros aparelhos agora (${result.error}).`; render(); }
+    } else if (action === "quick-date"){
+      state.inputDate = el.dataset.key;
+      render();
     } else if (action === "register-meal"){
-      const input = document.getElementById("mealTimeInput");
-      const time = input ? input.value : state.inputTime;
-      const entry = { dateKey: todayKey(), time };
+      const timeInput = document.getElementById("mealTimeInput");
+      const dateInput = document.getElementById("mealDateInput");
+      const time = timeInput ? timeInput.value : state.inputTime;
+      const dateKey = dateInput && dateInput.value ? dateInput.value : todayKey();
+      state.inputTime = time;
+      state.inputDate = dateKey;
+      const entry = { dateKey, time };
       state.lastMeal = entry;
       await saveLastMeal(entry);
       render();
     } else if (action === "clear-meal"){
+      if (state.lastMeal){ state.inputTime = state.lastMeal.time; state.inputDate = state.lastMeal.dateKey; }
       state.lastMeal = null;
       await clearLastMeal();
       render();
@@ -1564,20 +1701,109 @@ function attachEvents(){
         try{ await navigator.clipboard.writeText(text); el.textContent = "copiado!"; setTimeout(render, 1200); }
         catch(e){ el.textContent = "toque e segure o texto pra copiar"; }
       }
-    } else if (action === "admin-login"){
-      const pw = window.prompt("Senha da administradora:");
-      if (pw === null) return;
+    } else if (action === "admin-login-toggle"){
+      state.showAdminPasswordBox = true;
+      state.adminLoginError = null;
+      render();
+    } else if (action === "admin-login-submit"){
+      const pwInput = document.getElementById("adminPasswordInput");
+      const pw = pwInput ? pwInput.value : "";
       if (pw === ADMIN_PASSWORD){
         state.isAdmin = true;
+        state.authorized = true;
+        state.showAdminPasswordBox = false;
+        state.adminLoginError = null;
         try{ localStorage.setItem("isAdmin", "true"); }catch(e){}
         render();
       } else {
-        window.alert("Senha incorreta.");
+        state.adminLoginError = "Senha incorreta.";
+        render();
       }
     } else if (action === "admin-logout"){
       state.isAdmin = false;
       state.showManage = false;
+      state.showAdminPasswordBox = false;
       try{ localStorage.removeItem("isAdmin"); }catch(e){}
+      render();
+    } else if (action === "do-login"){
+      const nameInput = document.getElementById("loginNameInput");
+      const codeInput = document.getElementById("loginCodeInput");
+      const name = (nameInput && nameInput.value || "").trim();
+      const code = (codeInput && codeInput.value || "").trim();
+      state.loginNameDraft = name;
+      if (!name || !code){
+        state.loginError = "Preencha seu nome e o código de acesso.";
+        render();
+        return;
+      }
+      state.loginBusy = true;
+      state.loginError = null;
+      render();
+      const result = await fetchSharedUsers();
+      state.loginBusy = false;
+      if (result.error){
+        state.loginError = `Não consegui verificar o código agora (${result.error}). Tente de novo.`;
+        render();
+        return;
+      }
+      state.approvedUsers = result.users || {};
+      const expectedCode = state.approvedUsers[name];
+      if (expectedCode !== undefined && String(expectedCode) === code){
+        state.authorized = true;
+        state.authName = name;
+        state.loginError = null;
+        try{ localStorage.setItem("authName", name); localStorage.setItem("authCode", code); }catch(e){}
+        render();
+      } else {
+        state.loginError = "Nome ou código incorretos. Fale com a Ana Cristina pra liberar seu acesso.";
+        render();
+      }
+    } else if (action === "toggle-manage-users"){
+      state.showManageUsers = !state.showManageUsers;
+      state.usersError = null;
+      render();
+    } else if (action === "add-user"){
+      const nameInput = document.getElementById("newUserName");
+      const codeInput = document.getElementById("newUserCode");
+      const name = (nameInput && nameInput.value || "").trim();
+      const code = (codeInput && codeInput.value || "").trim();
+      if (!name || !code){
+        state.usersError = "Preencha o nome e o código antes de liberar.";
+        render();
+        return;
+      }
+      state.usersError = null;
+      render();
+      const fresh = await fetchSharedUsers();
+      const users = { ...((fresh && fresh.users) || state.approvedUsers || {}) };
+      users[name] = code;
+      const pushResult = await pushSharedUsers(users);
+      if (pushResult.ok){
+        state.approvedUsers = users;
+        state.usersError = null;
+      } else {
+        state.usersError = `Não consegui salvar (${pushResult.error || 'erro desconhecido'}).`;
+      }
+      render();
+    } else if (action === "remove-user"){
+      const name = el.dataset.name;
+      if (state.confirmRemoveUser !== name){
+        state.confirmRemoveUser = name;
+        render();
+        return;
+      }
+      state.confirmRemoveUser = null;
+      state.usersError = null;
+      render();
+      const fresh = await fetchSharedUsers();
+      const users = { ...((fresh && fresh.users) || state.approvedUsers || {}) };
+      delete users[name];
+      const pushResult = await pushSharedUsers(users);
+      if (pushResult.ok){
+        state.approvedUsers = users;
+      } else {
+        state.usersError = `Não consegui remover (${pushResult.error || 'erro desconhecido'}).`;
+      }
       render();
     }
   };
@@ -1675,7 +1901,33 @@ function attachEvents(){
   if (state.selectedKcal && !state.diets[state.selectedKcal]) state.selectedKcal = null;
   if (!state.selectedKcal) state.selectedKcal = "1300";
   state.lastMeal = await loadLastMeal();
+  state.selectedSubs = await loadSubSelections();
+  state.mealsDone = await loadMealsDone();
   try{ state.isAdmin = localStorage.getItem("isAdmin") === "true"; }catch(e){ state.isAdmin = false; }
+  if (state.isAdmin) state.authorized = true;
+
+  if (!state.authorized){
+    let savedName = null, savedCode = null;
+    try{ savedName = localStorage.getItem("authName"); savedCode = localStorage.getItem("authCode"); }catch(e){}
+    if (savedName && savedCode){
+      const usersResult = await fetchSharedUsers();
+      if (usersResult.users){
+        state.approvedUsers = usersResult.users;
+        if (usersResult.users[savedName] !== undefined && String(usersResult.users[savedName]) === savedCode){
+          state.authorized = true;
+          state.authName = savedName;
+        } else {
+          // Foi removida da lista (ou o código mudou) — desconecta e pede login de novo.
+          try{ localStorage.removeItem("authName"); localStorage.removeItem("authCode"); }catch(e){}
+        }
+      } else if (usersResult.error){
+        // Sem internet/erro ao sincronizar: mantém o acesso já concedido antes pra não travar quem já usa o app.
+        state.authorized = true;
+        state.authName = savedName;
+      }
+    }
+  }
+  state.authChecking = false;
   render();
 
   // Then refresh with whatever the shared database has (may be newer than this
